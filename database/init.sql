@@ -46,5 +46,5 @@ ON CONFLICT (name) DO NOTHING;
 -- 4. Seed Test Guests
 INSERT INTO guests (name, email, phone) VALUES
     ('Deepak Thakur', 'deepak@example.com', '+91-9876543210'),
-    ('System Test User', 'testuser@example.com', '+91-9123456780')
+    ('Vishal Nishad', 'vishal@example.com', '+91-9876543211')
 ON CONFLICT (email) DO NOTHING;
