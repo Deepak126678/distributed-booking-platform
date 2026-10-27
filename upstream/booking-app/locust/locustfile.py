@@ -1,174 +1,252 @@
+
 from locust import HttpUser, task, between
-import random
-from datetime import datetime, timedelta
-from typing import List, Dict, Tuple
+from datetime import date, timedelta
+from threading import Lock
+from typing import Any
 import logging
 import os
+import random
 
-# Configurar logging
-log_dir = "/locust/logs"
-os.makedirs(log_dir, exist_ok=True)
+# ---------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------
 
-# Configurar el logger para escribir en archivo y consola
+# /locust is mounted read-only in Docker.
+# /tmp is writable inside the Locust container.
+LOG_DIR = "/tmp/locust/logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(f"{log_dir}/locust_test_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler(
+            f"{LOG_DIR}/locust_test.log",
+            encoding="utf-8",
+        ),
+        logging.StreamHandler(),
+    ],
 )
+
 logger = logging.getLogger(__name__)
 
+API_PREFIX = "/api/v1"
+
+# Shared by users within a Locust process.
+# Each Locust worker process has its own copy.
+_setup_lock = Lock()
+_setup_complete = False
+_shared_guest_ids: list[int] = []
+_shared_unit_ids: list[int] = []
+
+
+def response_id(response) -> int | None:
+    """Extract an integer ID from a successful API response."""
+    try:
+        data = response.json()
+        value = data.get("id") if isinstance(data, dict) else None
+        return int(value) if value is not None else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
 class ReservationUser(HttpUser):
-    host = "http://app:8000"  # Cambiado para usar el nombre del servicio en docker-compose
+    host = "http://app:8000"
     wait_time = between(1, 3)
 
     def on_start(self):
-        """Inicializa los datos necesarios para las pruebas"""
-        logger.info("Iniciando usuario de prueba")
-        self.guest_ids = []
-        self.unit_ids = []
-        self.reservations: Dict[int, List[Tuple[str, str, int]]] = {}  # unit_id: [(check_in, check_out, guest_id)]
-        self.current_unit_index = 0  # Para llevar el control de la unidad actual
-        self.initialize_data()
+        """Prepare shared test data once per Locust worker process."""
+        global _setup_complete
 
-    def initialize_data(self):
-        """Crea las unidades y huéspedes iniciales"""
-        logger.info("Iniciando creación de unidades y huéspedes")
-        # Crear 20 unidades
-        for i in range(1, 21):
-            unit_num = i
-            payload = {
-                "name": f"Unit {unit_num}",
-                "description": f"Test unit {unit_num}",
-                "capacity": random.randint(2, 6),
-                "price_per_night": random.uniform(100.0, 500.0)
-            }
-            logger.info(f"Creando unidad {unit_num} con payload: {payload}")
-            try:
-                response = self.client.post("/api/v1/units/", json=payload)
-                if response.status_code == 200:
-                    unit_data = response.json()
-                    self.unit_ids.append(unit_data["id"])
-                    self.reservations[unit_data["id"]] = []
-                    logger.info(f"Unidad {unit_num} creada exitosamente con ID: {unit_data['id']}")
-                else:
-                    logger.error(f"Error al crear unidad {unit_num}: {response.status_code} - {response.text}")
-            except Exception as e:
-                logger.error(f"Error de conexión al crear unidad {unit_num}: {str(e)}")
+        self.reservation_ids: list[int] = []
 
-        # Crear 100 huéspedes
-        for i in range(1, 101):
-            guest_num = i
-            payload = {
-                "name": f"Guest {guest_num}",
-                "email": f"guest{guest_num}@example.com",
-                "phone": f"{guest_num}555{guest_num}"
-            }
-            logger.info(f"Creando huésped {guest_num} con payload: {payload}")
-            try:
-                response = self.client.post("/api/v1/guests/", json=payload)
-                if response.status_code == 200:
-                    guest_data = response.json()
-                    self.guest_ids.append(guest_data["id"])
-                    logger.info(f"Huésped {guest_num} creado exitosamente con ID: {guest_data['id']}")
-                else:
-                    logger.error(f"Error al crear huésped {guest_num}: {response.status_code} - {response.text}")
-            except Exception as e:
-                logger.error(f"Error de conexión al crear huésped {guest_num}: {str(e)}")
+        with _setup_lock:
+            if not _setup_complete:
+                self._initialize_shared_data()
+                _setup_complete = True
 
-    def get_next_dates(self, base_date: datetime) -> Tuple[str, str]:
-        """Genera las fechas de check-in y check-out para la siguiente reserva"""
-        check_in = base_date + timedelta(days=1)
-        check_out = check_in + timedelta(days=3)
-        return check_in.strftime("%Y-%m-%d"), check_out.strftime("%Y-%m-%d")
+        # Each simulated user uses the data created by setup.
+        self.guest_ids = list(_shared_guest_ids)
+        self.unit_ids = list(_shared_unit_ids)
 
-    @task(1)
-    def create_reservations(self):
-        """Crea reservas secuenciales para cada unidad"""
         if not self.guest_ids or not self.unit_ids:
-            logger.warning("No hay huéspedes o unidades disponibles para crear reservas")
-            return
+            logger.warning(
+                "No usable guests or units. "
+                "Check the API payloads and endpoint responses."
+            )
 
-        # Fecha base para comenzar las reservas
-        current_date = datetime.now()
-        end_date = current_date + timedelta(days=150)  # 5 meses aproximadamente
-        logger.info(f"Iniciando creación de reservas desde {current_date} hasta {end_date}")
+    def _initialize_shared_data(self):
+        """
+        Create a small pool of guests and units per Locust worker.
 
-        while current_date < end_date:
-            # Obtener la unidad actual
-            current_unit_id = self.unit_ids[self.current_unit_index]
-            
-            # Obtener un huésped aleatorio
-            guest_id = random.choice(self.guest_ids)
-            
-            # Generar fechas para la reserva
-            check_in, check_out = self.get_next_dates(current_date)
-            
-            # Crear la reserva
+        For a repeatable test, use a separate seed-data step instead.
+        """
+        logger.info("Initializing Locust test data")
+
+        # Create a small number of units.
+        for i in range(1, 6):
             payload = {
-                "guest_id": guest_id,
-                "unit_id": current_unit_id,
-                "check_in_date": check_in,
-                "check_out_date": check_out,
-                "adults": random.randint(1, 4),
-                "children": random.randint(0, 3)
+                "name": f"Locust Unit {i}",
+                "description": f"Load-test unit {i}",
+                "capacity": random.randint(2, 6),
+                "price_per_night": round(random.uniform(100, 500), 2),
             }
-            
-            logger.info(f"Intentando crear reserva: Unidad {current_unit_id}, Huésped {guest_id}, Fechas {check_in} - {check_out}")
-            
+
             try:
-                response = self.client.post("/api/v1/reservations/", json=payload)
-                
-                if response.status_code == 200:
-                    # Registrar la reserva
-                    if current_unit_id not in self.reservations:
-                        self.reservations[current_unit_id] = []
-                    self.reservations[current_unit_id].append((check_in, check_out, guest_id))
-                    logger.info(f"Reserva creada exitosamente: Unidad {current_unit_id}, Huésped {guest_id}")
-                    
-                    # Avanzar al siguiente día
-                    current_date = datetime.strptime(check_out, "%Y-%m-%d")
-                    
-                    # Avanzar a la siguiente unidad
-                    self.current_unit_index = (self.current_unit_index + 1) % len(self.unit_ids)
-                else:
-                    logger.error(f"Error al crear reserva: {response.status_code} - {response.text}")
-                    # Si hay un error, avanzar al siguiente día de todos modos
-                    current_date = current_date + timedelta(days=1)
-            except Exception as e:
-                logger.error(f"Error de conexión al crear reserva: {str(e)}")
-                current_date = current_date + timedelta(days=1)
+                with self.client.post(
+                    f"{API_PREFIX}/units/",
+                    json=payload,
+                    name="Setup: create unit",
+                    catch_response=True,
+                ) as response:
+                    if response.status_code not in (200, 201):
+                        response.failure(
+                            f"Unit creation failed: "
+                            f"{response.status_code} {response.text}"
+                        )
+                        continue
 
+                    unit_id = response_id(response)
+                    if unit_id is None:
+                        response.failure(
+                            "Unit response did not contain an integer 'id'"
+                        )
+                        continue
 
-    @task(1)
+                    _shared_unit_ids.append(unit_id)
+                    logger.info("Created test unit id=%s", unit_id)
+
+            except Exception:
+                logger.exception("Error while creating test unit")
+
+        # Create a small number of guests.
+        for i in range(1, 11):
+            payload = {
+                "name": f"Locust Guest {i}",
+                "email": f"locust_guest_{i}@example.com",
+                "phone": f"700000{i:04d}",
+            }
+
+            try:
+                with self.client.post(
+                    f"{API_PREFIX}/guests/",
+                    json=payload,
+                    name="Setup: create guest",
+                    catch_response=True,
+                ) as response:
+                    if response.status_code not in (200, 201):
+                        response.failure(
+                            f"Guest creation failed: "
+                            f"{response.status_code} {response.text}"
+                        )
+                        continue
+
+                    guest_id = response_id(response)
+                    if guest_id is None:
+                        response.failure(
+                            "Guest response did not contain an integer 'id'"
+                        )
+                        continue
+
+                    _shared_guest_ids.append(guest_id)
+                    logger.info("Created test guest id=%s", guest_id)
+
+            except Exception:
+                logger.exception("Error while creating test guest")
+
+        logger.info(
+            "Test data initialized: %s units, %s guests",
+            len(_shared_unit_ids),
+            len(_shared_guest_ids),
+        )
+
+    @task(3)
+    def list_guests(self):
+        """Exercise the guest-list endpoint."""
+        self.client.get(
+            f"{API_PREFIX}/guests/",
+            name="GET guests",
+        )
+
+    @task(3)
+    def list_units(self):
+        """Exercise the unit-list endpoint."""
+        self.client.get(
+            f"{API_PREFIX}/units/",
+            name="GET units",
+        )
+
+    @task(2)
+    def create_reservation(self):
+        """Create one reservation per task invocation."""
+        if not self.guest_ids or not self.unit_ids:
+            return
+
+        guest_id = random.choice(self.guest_ids)
+        unit_id = random.choice(self.unit_ids)
+
+        # Vary the future date range to reduce booking conflicts.
+        check_in_date = date.today() + timedelta(
+            days=random.randint(10, 180)
+        )
+        check_out_date = check_in_date + timedelta(
+            days=random.randint(1, 5)
+        )
+
+        payload = {
+            "guest_id": guest_id,
+            "unit_id": unit_id,
+            "check_in_date": check_in_date.isoformat(),
+            "check_out_date": check_out_date.isoformat(),
+            "adults": random.randint(1, 4),
+            "children": random.randint(0, 3),
+        }
+
+        with self.client.post(
+            f"{API_PREFIX}/reservations/",
+            json=payload,
+            name="POST reservation",
+            catch_response=True,
+        ) as response:
+            if response.status_code not in (200, 201):
+                response.failure(
+                    f"Reservation failed: "
+                    f"{response.status_code} {response.text}"
+                )
+                return
+
+            reservation_id = response_id(response)
+            if reservation_id is None:
+                response.failure(
+                    "Reservation response did not contain an integer 'id'"
+                )
+                return
+
+            self.reservation_ids.append(reservation_id)
+
+            # Keep memory use bounded during long load tests.
+            if len(self.reservation_ids) > 100:
+                self.reservation_ids.pop(0)
+
+            logger.info(
+                "Created reservation id=%s unit_id=%s guest_id=%s",
+                reservation_id,
+                unit_id,
+                guest_id,
+            )
+
+    @task(2)
     def get_reservation(self):
-        """Obtiene una reserva existente"""
-        if not self.reservations:
-            logger.warning("No hay reservas disponibles para consultar")
+        """Retrieve a reservation created by this simulated user."""
+        if not self.reservation_ids:
             return
 
-        # Seleccionar una unidad aleatoria que tenga reservas
-        unit_id = random.choice(list(self.reservations.keys()))
-        if not self.reservations[unit_id]:
-            return
+        reservation_id = random.choice(self.reservation_ids)
 
-        # Seleccionar una reserva aleatoria de la unidad
-        reservation = random.choice(self.reservations[unit_id])
-        check_in, check_out, guest_id = reservation
-
-        logger.info(f"Consultando reserva: Unidad {unit_id}, Fechas {check_in} - {check_out}")
-        try:
-            response = self.client.get(f"/api/v1/reservations/{unit_id}")
-            if response.status_code == 200:
-                logger.info(f"Reserva consultada exitosamente: {response.json()}")
-            else:
-                logger.error(f"Error al consultar reserva: {response.status_code} - {response.text}")
-        except Exception as e:
-            logger.error(f"Error de conexión al consultar reserva: {str(e)}")
+        self.client.get(
+            f"{API_PREFIX}/reservations/{reservation_id}",
+            name="GET reservation by ID",
+        )
 
 
-
-# Asegurarse de que la clase esté disponible para Locust
-__all__ = ['ReservationUser']
+__all__ = ["ReservationUser"]
