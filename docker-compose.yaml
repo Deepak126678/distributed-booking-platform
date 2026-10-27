@@ -1,0 +1,257 @@
+
+name: booking-dev
+
+services:
+  # Redis: Celery result backend and caching
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # MailHog: capture test emails locally
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    ports:
+      - "8026:8025"
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # Prometheus: metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./infra/observability/prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # Grafana: metrics dashboards
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GF_SECURITY_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:-booking_grafana_dev_password}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    depends_on:
+      - prometheus
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # PostgreSQL: application database
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-booking_dev_only_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-reservations}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - app-network
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"'
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # pgAdmin: database administration UI
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    ports:
+      - "5051:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-booking_pgadmin_dev_password}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # FastAPI reservation API
+  app:
+    build:
+      context: ./upstream/booking-app
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-booking_dev_only_change_me}@postgres:5432/${POSTGRES_DB:-reservations}
+      CELERY_BROKER_URL: amqp://${RABBITMQ_DEFAULT_USER:-booking_admin}:${RABBITMQ_DEFAULT_PASS:-booking_rabbit_dev_password}@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      SMTP_HOST: mailhog
+      SMTP_PORT: "1025"
+      FROM_EMAIL: noreply@example.com
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./upstream/booking-app/app:/app/app
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --reload
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # Celery worker: asynchronous tasks
+  celery_worker:
+    build:
+      context: ./upstream/booking-app
+      dockerfile: Dockerfile.worker
+    environment:
+      CELERY_BROKER_URL: amqp://${RABBITMQ_DEFAULT_USER:-booking_admin}:${RABBITMQ_DEFAULT_PASS:-booking_rabbit_dev_password}@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      SMTP_HOST: mailhog
+      SMTP_PORT: "1025"
+      FROM_EMAIL: noreply@example.com
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # Flower: Celery task monitoring
+  flower:
+    build:
+      context: ./upstream/booking-app
+      dockerfile: Dockerfile.worker
+    command:
+      - celery
+      - -A
+      - app.worker
+      - flower
+      - --port=5555
+    ports:
+      - "5556:5555"
+    environment:
+      CELERY_BROKER_URL: amqp://${RABBITMQ_DEFAULT_USER:-booking_admin}:${RABBITMQ_DEFAULT_PASS:-booking_rabbit_dev_password}@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      celery_worker:
+        condition: service_started
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # OpenTelemetry Collector
+  otel-collector:
+    image: otel/opentelemetry-collector:latest
+    command:
+      - --config=/etc/otel-collector-config.yaml
+    volumes:
+      - ./infra/observability/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # RabbitMQ: Celery message broker
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-booking_admin}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-booking_rabbit_dev_password}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # Locust: load-testing master
+  locust:
+    build:
+      context: ./upstream/booking-app
+      dockerfile: Dockerfile.locust
+    command:
+      - -f
+      - /locust/locustfile.py
+      - --master
+      - --host=http://app:8000
+    ports:
+      - "8090:8089"
+    volumes:
+      - ./upstream/booking-app/locust:/locust:ro
+    depends_on:
+      - app
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # Locust: load-testing worker
+  locust-worker:
+    build:
+      context: ./upstream/booking-app
+      dockerfile: Dockerfile.locust
+    command:
+      - -f
+      - /locust/locustfile.py
+      - --worker
+      - --master-host=locust
+    volumes:
+      - ./upstream/booking-app/locust:/locust:ro
+    depends_on:
+      - locust
+      - app
+    networks:
+      - app-network
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+  postgres_data:
+  rabbitmq_data:
+
+networks:
+  app-network:
+    name: booking-dev_app-network
+    driver: bridge
