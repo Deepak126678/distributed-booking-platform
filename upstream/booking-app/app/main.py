@@ -9,6 +9,9 @@ import os
 from prometheus_client import make_asgi_app
 from fastapi.responses import PlainTextResponse, JSONResponse
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from datetime import datetime, timezone
+from fastapi.exceptions import RequestValidationError
+from fastapi import HTTPException
 
 # Create database tables
 try:
@@ -51,9 +54,54 @@ email_service = EmailService()
 async def root():
     return {"message": "Welcome to the Reservation System API"}
 
+# ----------------- Standardized Error Handlers -----------------
+
+# 1. Handles Pydantic Input Validation Errors (HTTP 422)
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    # Extract the first human-readable validation error message
+    first_error = exc.errors()[0] if exc.errors() else {}
+    error_msg = first_error.get("msg", "Invalid input data")
+    field = ".".join(str(loc) for loc in first_error.get("loc", []))
+    
+    return JSONResponse(
+        status_code=422,
+        content={
+            "success": false,
+            "status_code": 422,
+            "error_type": "VALIDATION_ERROR",
+            "message": f"{field}: {error_msg}" if field else error_msg,
+            "path": str(request.url.path),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    )
+
+# 2. Handles Standard HTTP Exceptions (400, 404, 409, etc.)
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "success": false,
+            "status_code": exc.status_code,
+            "error_type": "HTTP_ERROR",
+            "message": exc.detail,
+            "path": str(request.url.path),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    )
+
+# 3. Global Fallback for Unexpected Crashes (HTTP 500)
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal Server Error", "type": str(type(exc).__name__)},
-    ) 
+        content={
+            "success": false,
+            "status_code": 500,
+            "error_type": "INTERNAL_SERVER_ERROR",
+            "message": "An unexpected error occurred. Please try again later.",
+            "path": str(request.url.path),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    )
