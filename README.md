@@ -211,6 +211,13 @@ Run the command from the repository root:
 docker compose -p booking-dev -f docker-compose.yaml up -d --build
 ```
 
+### 2.1. normal start and cert creation
+
+```bash
+.\scripts\generate-dev-certs.ps1
+docker compose -p booking-dev -f .\docker-compose.yaml up -d
+```
+
 ### 3. Verify the containers
 
 ```bash
