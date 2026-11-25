@@ -39,3 +39,8 @@ logs/
 *.swp
 .DS_Store
 Thumbs.db
+
+
+# Local development TLS certificates
+infra/nginx/certs/*.key
+infra/nginx/certs/*.crt
