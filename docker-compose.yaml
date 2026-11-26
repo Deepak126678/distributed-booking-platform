@@ -103,7 +103,7 @@ services:
     ports:
       - "8080:8000"
     environment:
-      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-admin}@postgres:5432/${POSTGRES_DB:-reservations}
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-booking_dev_only_change_me}@postgres:5432/${POSTGRES_DB:-reservations}
       CELERY_BROKER_URL: amqp://${RABBITMQ_DEFAULT_USER:-booking_admin}:${RABBITMQ_DEFAULT_PASS:-booking_rabbit_dev_password}@rabbitmq:5672//
       CELERY_RESULT_BACKEND: redis://redis:6379/0
       SMTP_HOST: mailhog

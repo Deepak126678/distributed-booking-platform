@@ -49,20 +49,28 @@ def has_overlapping_reservation(db: Session, unit_id: int, check_in: date, check
     return query.first() is not None
 
 def create_reservation(db: Session, reservation: schemas.ReservationCreate):
-    # Check if the unit exists
-    unit = db.query(models.Unit).filter(models.Unit.id == reservation.unit_id).first()
+    # 1. Acquire an exclusive row-level lock on the target unit
+    # In PostgreSQL, this issues: SELECT * FROM units WHERE id = :id FOR UPDATE
+    # Any concurrent transactions competing for this room will queue and wait here.
+    unit = (
+        db.query(models.Unit)
+        .filter(models.Unit.id == reservation.unit_id)
+        .with_for_update()
+        .first()
+    )
     if not unit:
         raise ValueError("Unit not found")
     
-    # Check if the guest exists
+    # 2. Check if the guest exists
     guest = db.query(models.Guest).filter(models.Guest.id == reservation.guest_id).first()
     if not guest:
         raise ValueError("Guest not found")
     
-    # Check for overlapping reservations
+    # 3. Check for overlapping reservations while holding the unit lock
     if has_overlapping_reservation(db, reservation.unit_id, reservation.check_in_date, reservation.check_out_date):
         raise ValueError("Unit is already reserved for these dates")
     
+    # 4. Insert reservation and commit transaction (releasing the lock)
     db_reservation = models.Reservation(**reservation.model_dump())
     db.add(db_reservation)
     db.commit()
